@@ -1,0 +1,1218 @@
+#!/usr/bin/python
+"""
+  vdo - Albireo VDO management utility
+
+  Copyright (c) 2012-2013 Permabit Technology Corporation.
+  @LICENSE@
+  $Id: //eng/vdo-releases/nitrogen/src/c++/vdo/bin/vdo#10 $
+
+"""
+#pylint: disable=C0302
+
+from __future__ import print_function
+
+import copy
+import gettext
+import logging
+import locale
+import optparse
+import os
+import re
+import sys
+from textwrap import TextWrapper
+from vdomgmnt import *
+
+
+gettext.install('vdo')
+
+
+class VdoOperations(object):
+  """Implements the subcommands supported by the vdo program.
+
+  Every public method in VdoOperations runs one of the subcommands
+  requested when 'vdo [<options>] <subcommand>' is called. Each one
+  takes a dictionary of command line arguments and returns the desired
+  exit value of the vdo program. Normal exit values are 0 for success
+  and 1 for failure, except for start and stop, which return the
+  /etc/init.d exit codes defined in the LSB (these are spelled as
+  'Service.SUCCESS' and so forth for clarity).
+  """
+  log = Logger.getLogger(Logger.myname + '.VdoOperations')
+
+  def __init__(self):
+    Extensions.extensionPoint(self, "VDOCommand", "add")
+
+  def create(self, args):
+    """Implements the create command."""
+    if not self.rootCheck("create") or not self._binaryCheck():
+      return 1
+    self._createArgCheck(args)
+
+    albireoIndexDir = Defaults.getAlbireoIndexDir(args)
+    albireoSize = Defaults.getAlbireoSize(args)
+    enabled = not args.noEnable
+
+    self.log.debug("confFile is {0}".format(args.confFile))
+    with Configuration(args.confFile, readonly=False) as conf:
+
+      # check for duplicates
+      networkSpec = args.address + ":" + str(args.port)
+      server = 'dedupe://' + networkSpec
+      if conf.haveVdo(args.name):
+        self.log.error(_("VDO volume {0} already exists").format(args.name))
+        return 1
+      if conf.haveAlbserver(server):
+        self.log.error(_("Albireo server {0} already exists").format(server))
+        return 1
+      self.log.announce(_("Creating VDO volume {0}").format(args.name))
+
+      # make sure the kernel module is available
+      kms = KernelModuleService()
+      if kms.start() != Service.SUCCESS:
+        self.log.error(_("Kernel module {0} not installed").format(
+            kms.getName()))
+        return 1
+      kms.setLogLevel(args.vdoLogLevel)
+
+      # create the VDO and albserver objects
+      lvIndex, lvVdo = self._getAndValidateLvNames(args)
+      vdoLvPath = os.sep.join(['', 'dev', args.volumeGroup, lvVdo])
+      albLvPath = os.sep.join(['', 'dev', args.volumeGroup, lvIndex])
+
+      alb = AlbireoService(server, enabled=enabled, indexPath=albireoIndexDir,
+                           logicalVolumePath=albLvPath, memory=args.albireoMem,
+                           networkSpec=networkSpec, size=str(albireoSize),
+                           sparse=args.albireoSparse)
+
+      if not args.vdoRecoveryScanRate:
+        args.vdoRecoveryScanRate = Defaults.recoveryScanRate
+      if not args.vdoRecoverySweepRate:
+        args.vdoRecoverySweepRate = Defaults.recoverySweepRate
+      if not args.mdRaid5Mode:
+        args.mdRaid5Mode = Defaults.mdRaid5Mode
+      vdo = VdoService(args.name, 
+                       blockMapCacheSize=args.blockMapCacheSize,
+                       blockMapPageSize=args.blockMapPageSize,
+                       enable512e=args.enable512e,
+                       enableCompression=args.enableCompression,
+                       enableDeduplication=args.enableDeduplication,
+                       enabled=enabled,
+                       logicalSize=args.vdoLogicalSize,
+                       logicalVolumePath=vdoLvPath,
+                       mdRaid5Mode=args.mdRaid5Mode,
+                       physicalSize=args.vdoPhysicalSize,
+                       readCacheSize=args.vdoReadCacheSize,
+                       recoveryScanRate=args.vdoRecoveryScanRate,
+                       recoverySweepRate=args.vdoRecoverySweepRate,
+                       reserveSize=args.vdoRecoveryReserveSize,
+                       server=server,
+                       writePolicy=args.writePolicy)
+      conf.addVdo(args.name, vdo)
+      conf.addAlbserver(server, alb)
+
+      # now do the create and start operations
+      if alb.create() != Service.SUCCESS:
+        return 1
+      if alb.start() != Service.SUCCESS:
+        alb.remove()
+        return 1
+      if vdo.create() != Service.SUCCESS:
+        alb.stop()
+        alb.remove()
+        return 1
+      if vdo.start(alb.networkSpec) != Service.SUCCESS:
+        vdo.remove()
+        alb.stop()
+        alb.remove()
+        return 1
+      conf.persist()
+
+    # install the /etc/init.d script
+    if args.albireoBinaryPath:
+      albpath = args.albireoBinaryPath
+    else:
+      brandname = Brand.map('albserver')
+      albpath = os.path.dirname(Utils.which(brandname))
+    initScript = InitScriptService(confFile=args.confFile,
+                                   customFile=args.customFile,
+                                   logLevel=args.vdoLogLevel)
+    if initScript.create(albpath) != Service.SUCCESS:
+      vdo.remove()
+      alb.stop()
+      alb.remove()
+      return 1
+
+    self.log.announce(_("VDO volume is ready at {0}").format(vdo.getPath()))
+    return 0
+
+  @staticmethod
+  def _createArgCheck(args):
+    """Performs argument checks for the create command.
+
+    Arguments:
+      args: the OptionParser options object
+    Raises:
+      ArgumentError
+    """
+    if not args.name:
+      raise ArgumentError(_("Missing required argument '--name'"))
+    if args.vdoRecoveryReserveSize != Defaults.reserveSize:
+      if not args.vdoRecoveryScanRate:
+        raise ArgumentError(_("Missing required argument"
+                              " '--vdoRecoveryScanRate'"))
+      if not args.vdoRecoverySweepRate:
+        raise ArgumentError(_("Missing required argument"
+                              " '--vdoRecoverySweepRate'"))
+    AlbireoService.createArgCheck(args)
+
+  @staticmethod
+  def _getAndValidateLvNames(args):
+    """Return a tuple (lvIndex, lvVdo) of logical volume names, either
+    the ones specified by the user or defaults constructed from the
+    VDO volume name as appropriate. Checks the return values for
+    validity.
+
+    Arguments:
+      args: the OptionParser options object
+    Raises:
+      ArgumentError
+    """
+    lvIndex, lvVdo = Defaults.getLvNames(args)
+
+    indexLogicalVolume = LogicalVolume(os.sep.join(['', 'dev',
+                                                    args.volumeGroup,
+                                                    lvIndex]))
+    indexLogicalVolume.canCreate()
+    vdoLogicalVolume = LogicalVolume(os.sep.join(['', 'dev',
+                                                  args.volumeGroup,
+                                                  lvVdo]))
+    vdoLogicalVolume.canCreate()
+    return lvIndex, lvVdo
+
+  def remove(self, args):
+    """Implements the remove command."""
+    if not self.rootCheck("remove") or not self._binaryCheck():
+      return 1
+    removeInitScript = False
+    retval = 0
+    with Configuration(args.confFile, readonly=False, deleteEmpty=True) as conf:
+      vdos = self.getVdos(args, conf)
+
+      for vdo in vdos:
+        self.log.announce(_("Removing VDO {0}").format(vdo.getName()))
+        if vdo.stop(args.force) == Service.ERROR:
+          retval = 1
+          continue
+        vdo.remove()
+        alb = conf.getAlbserver(vdo.server)
+        alb.stop()
+        alb.remove()
+        conf.removeAlbserver(alb.getName())
+        conf.removeVdo(vdo.getName())
+        if conf.empty():
+          removeInitScript = True
+      conf.persist()
+    if removeInitScript:
+      initScript = InitScriptService(confFile=args.confFile,
+                                     customFile=args.customFile,
+                                     logLevel=args.vdoLogLevel)
+      if initScript.remove() != Service.SUCCESS:
+        retval = 1
+    return retval
+
+  def modify(self, args):
+    """Modifies certain parameters of a VDO device."""
+    # Options that can be changed for an already-created VDO device,
+    # though not necessarily while the device is running. The
+    # command-line options and VdoService device may use different names;
+    # hence the mapping.
+    modifiableOptions = {
+      'mdRaid5Mode': 'mdRaid5Mode',
+      'writePolicy': 'writePolicy',
+    }
+    # This should cover every option fixed at creation time that
+    # someone might even think could be changed later. But they have
+    # to default to None in the option processing so we can
+    # distinguish presence from absence.
+    fixedOptions = ( 'albireoIndexDir', 'albireoSize', 'lvIndex', 'lvVdo' )
+    for optionName in fixedOptions:
+      if getattr(args, optionName) is not None:
+        self.log.error(_("Cannot change option {0} after VDO creation").format(
+          optionName))
+        return Service.ERROR
+    anyRunning = False
+    with Configuration(args.confFile, readonly=False) as conf:
+      vdos = self.getVdos(args, conf)
+      for vdo in vdos:
+        running = vdo.running()
+        for optionName in modifiableOptions.keys():
+          if getattr(args, optionName) is not None:
+            anyRunning |= running
+            setattr(vdo, modifiableOptions[optionName],
+                    getattr(args, optionName))
+        conf.addVdo(vdo.getName(), vdo, True)
+      # We could warn if nothing was changed...
+      conf.persist()
+    if anyRunning:
+      self.log.announce("Note: Changes will not apply until VDO is restarted")
+    return Service.SUCCESS
+
+  def start(self, args):
+    """Implements the start command."""
+    if not self.rootCheck("start") or not self._binaryCheck():
+      return Service.ERROR
+    with Configuration(args.confFile) as conf:
+      vdos = self.getVdos(args, conf)
+
+      retval = Service.SUCCESS
+      for vdo in vdos:
+        self.log.announce(_("Starting VDO {0}").format(vdo.getName()))
+        rv = Service.SUCCESS
+        alb = conf.getAlbserver(vdo.server)
+        if vdo.enableDeduplication:
+          readyCmd = " ".join([Logger.mypath, '--name', vdo.getName(),
+                               'internalServiceHook'])
+          rv = alb.start(readyCmd)
+        if rv == Service.SUCCESS:
+          rv = vdo.start(alb.networkSpec, args.rebuildStatistics,
+                         args.forceRebuild)
+          if rv != Service.SUCCESS:
+            alb.stop()
+        retval = Utils.maxNum(rv, retval)
+    return retval
+
+  def stop(self, args):
+    """Implements the stop command."""
+    if not self.rootCheck("stop") or not self._binaryCheck():
+      return Service.ERROR
+    with Configuration(args.confFile) as conf:
+      vdos = self.getVdos(args, conf)
+
+      retval = Service.SUCCESS
+      for vdo in vdos:
+        self.log.announce(_("Stopping VDO {0}").format(vdo.getName()))
+        rv = vdo.stop(args.force)
+        retval = Utils.maxNum(rv, retval)
+        alb = conf.getAlbserver(vdo.server)
+        rv = alb.stop()
+        if rv == Service.ALREADY:
+          rv = Service.SUCCESS
+        retval = Utils.maxNum(rv, retval)
+    return retval
+
+  def _startDeduplication(self, vdo, alb):
+    """Starts deduplication on a VDO volume if it is running.
+
+    Arguments:
+      vdo (VdoService): the VDO volume
+      alb (AlbireoService): the VDO volume's Albireo server
+    Returns:
+      Service.SUCCESS or Service.ERROR
+    """
+    if vdo.running():
+      self.log.announce(_("Starting deduplication on VDO {0}").format(
+          vdo.getName()))
+      rv = alb.start()
+      if rv == Service.SUCCESS:
+        dmsetupCmd = Command(["dmsetup", "message", vdo.getName(),
+                              "0", "reconnect"])
+        try:
+          dmsetupCmd()
+        except CommandError:
+          self.log.error(_("Cannot start deduplication on VDO {0}").format(
+              vdo.getName()))
+          return Service.ERROR
+      elif rv != Service.ALREADY:
+        return rv
+    return Service.SUCCESS
+
+  def _stopDeduplication(self, vdo, alb):
+    """Stops deduplication on a VDO volume if it is running.
+
+    Arguments:
+      vdo (VdoService): the VDO volume
+      alb (AlbireoService): the VDO volume's Albireo server
+    Returns:
+      Service.SUCCESS or Service.ERROR
+    """
+    if vdo.running():
+      self.log.announce(_("Stopping deduplication on VDO {0}").format(
+          vdo.getName()))
+      rv = alb.stop()
+      if rv == Service.SUCCESS:
+        dmsetupCmd = Command(["dmsetup", "message", vdo.getName(),
+                              "0", "disconnect"])
+        try:
+          dmsetupCmd()
+        except CommandError:
+          self.log.error(_("Cannot stop deduplication on VDO {0}").format(
+              vdo.getName()))
+          return Service.ERROR
+      elif rv != Service.ALREADY:
+        return rv
+    return Service.SUCCESS
+
+  def enableDeduplication(self, args):
+    """Implements the enableDeduplication command."""
+    if not self.rootCheck("enableDeduplication") or not self._binaryCheck():
+      return Service.ERROR
+    with Configuration(args.confFile, readonly=False) as conf:
+      vdos = self.getVdos(args, conf)
+
+      retval = Service.SUCCESS
+      for vdo in vdos:
+        vdoName = vdo.getName()
+        self.log.announce(_("Enabling deduplication on VDO {0}").format(
+            vdoName))
+        if vdo.enableDeduplication:
+          self.log.info(_("Deduplication already enabled on VDO {0}").format(
+              vdoName))
+        else:
+          vdo.enableDeduplication = True
+          conf.addVdo(vdoName, vdo, True)
+      conf.persist()
+
+      for vdo in vdos:
+        rv = self._startDeduplication(vdo, conf.getAlbserver(vdo.server))
+        retval = Utils.maxNum(rv, retval)
+
+    return retval
+
+  def disableDeduplication(self, args):
+    """Implements the disableDeduplication command."""
+    if not self.rootCheck("disableDeduplication") or not self._binaryCheck():
+      return Service.ERROR
+    with Configuration(args.confFile, readonly=False) as conf:
+      vdos = self.getVdos(args, conf)
+
+      retval = Service.SUCCESS
+      for vdo in vdos:
+        vdoName = vdo.getName()
+        self.log.announce(_("Disabling deduplication on VDO {0}").format(
+            vdoName))
+        if not vdo.enableDeduplication:
+          self.log.info(_("Deduplication already disabled on VDO {0}").format(
+              vdoName))
+        else:
+          vdo.enableDeduplication = False
+          conf.addVdo(vdoName, vdo, True)
+      conf.persist()
+
+      for vdo in vdos:
+        rv = self._stopDeduplication(vdo, conf.getAlbserver(vdo.server))
+        retval = Utils.maxNum(rv, retval)
+
+    return retval
+
+  def enable(self, args):
+    """Implements the enable command."""
+    if not self.rootCheck("enable"):
+      return 1
+    with Configuration(args.confFile, readonly=False) as conf:
+      vdos = self.getVdos(args, conf)
+
+      retval = 0
+      for vdo in vdos:
+        if vdo.enabled:
+          retval = 1
+        else:
+          vdoName = vdo.getName()
+          self.log.announce(_("Enabling VDO {0}").format(vdoName))
+          vdo.enabled = True
+          conf.addVdo(vdoName, vdo, True)
+        alb = conf.getAlbserver(vdo.server)
+        if alb is not None:
+          alb.enabled = True
+          conf.addAlbserver(vdo.server, alb, True)
+      conf.persist()
+    return retval
+
+  def disable(self, args):
+    """Implements the disable command."""
+    if not self.rootCheck("disable"):
+      return 1
+    with Configuration(args.confFile, readonly=False) as conf:
+      vdos = self.getVdos(args, conf)
+
+      retval = 0
+      for vdo in vdos:
+        vdoName = vdo.getName()
+        if not vdo.enabled:
+          retval = 1
+        else:
+          self.log.announce(_("Disabling VDO {0}").format(vdoName))
+          vdo.enabled = False
+          conf.addVdo(vdoName, vdo, True)
+        alb = conf.getAlbserver(vdo.server)
+        if alb is not None:
+          alb.enabled = False
+          conf.addAlbserver(vdo.server, alb, True)
+      conf.persist()
+    return retval
+
+  def status(self, args):
+    """Implements the status command."""
+    #pylint: disable=R0201
+    if not self._binaryCheck():
+      return 1
+    if Command.noRunMode():
+      self.log.error(_("status command not available with --noRun"))
+      return 1
+    with Configuration(args.confFile, mustExist=True) as conf:
+
+      print(_("VDO status:"))
+      print(_("  Node: ") + Command(['uname', '-n']).runOutput().strip())
+      print(_("  Date: ") + Command(
+          ['date', '--rfc-3339=seconds']).runOutput().strip())
+      if os.getuid() != 0:
+        print(_("  Note: not running as root, some status may be unavailable"))
+
+      KernelModuleService().status("")
+      conf.status("")
+
+      print(_("VDOs: "))
+      for vdo in conf.getAllVdos():
+        conf.getVdo(vdo).status("  ")
+
+      print(_("Albservers: "))
+      for alb in conf.getAllAlbservers():
+        conf.getAlbserver(alb).status("  ")
+    return 0
+
+  def list(self, unused_args):
+    """Implements the list command."""
+    if not self.rootCheck("list"):
+      return 1
+    status = Command(['dmsetup', 'status']).runOutput()
+    if status:
+      for line in status.splitlines():
+        m = re.match(r"(.+?): \d \d+ dedupe", line)
+        if m:
+          print(m.group(1))
+    return 0
+
+  def listExtensions(self, unused_args):
+    """Lists the currently loaded extensions."""
+    #pylint: disable=R0201
+    Extensions.listExtensions()
+    return 0
+
+  def printConfigFile(self, args):
+    """Implements the printConfigFile command."""
+    #pylint: disable=R0201
+    if Command.noRunMode():
+      self.log.error(_("printConfigFile command not available with --noRun"))
+      return 1
+    with Configuration(args.confFile, mustExist=True) as conf:
+      print(repr(conf))
+    return 0
+
+  def growPhysical(self, args):
+    """Implements the growPhysical command."""
+    if not self.rootCheck("growPhysical") or not self._binaryCheck():
+      return 1
+    with Configuration(args.confFile, readonly=False) as conf:
+      if not args.name:
+        raise ArgumentError(_("Missing required argument '--name'"))
+
+      # Confirm that the volume exists, is running, and we're growing
+      if not conf.haveVdo(args.name):
+        raise ArgumentError(_("VDO volume {0} not found").format(args.name))
+      vdo = conf.getVdo(args.name)
+      if not vdo.running():
+        self.log.error(_("VDO volume {0} must be running").format(
+            args.name))
+        return 1
+      if args.vdoPhysicalSize and args.vdoPhysicalSize <= vdo.physicalSize:
+        self.log.error(_("Can't shrink a VDO volume (old size {0})").format(
+            vdo.physicalSize))
+        return 1
+
+      retval = vdo.growPhysical(args.vdoPhysicalSize)
+      if retval:
+        return retval
+
+      conf.addVdo(args.name, vdo, True)
+      conf.persist()
+    return 0
+
+  def growLogical(self, unused_args):
+    """Implements the growLogical command."""
+    if not self.rootCheck("growLogical"):
+      return 1
+    self.log.error(_("Sorry, the growLogical command is not yet implemented"))
+    return 1
+
+  def version(self, unused_args):
+    """Implements the version command."""
+    if not self.rootCheck("version"):
+      return 1
+    kms = KernelModuleService()
+    if kms.start() == 0:
+      print(kms.version())
+    return 0
+
+  def internalServiceHook(self, args):
+    """Hook called by albserver when it's finished rebuilding its
+    index and is ready to service deduplication requests. For internal
+    use only."""
+    if not self.rootCheck("internalServiceHook"):
+      return 1
+    if not args.name:
+      raise ArgumentError(_("Missing required argument '--name'"))
+    dmsetupCmd = Command(['dmsetup', 'message', args.name, '0', 'reconnect'])
+    try:
+      dmsetupCmd()
+      return 0
+    except CommandError as (msg):
+      self.log.error(msg)
+      return 1
+
+  def printInitScript(self, unused_args):
+    """Implements the printInitScript command."""
+    #pylint: disable=R0201
+    print(InitScriptService().getInitScript(''))
+
+  def getOperation(self, name):
+    """Returns a method on objects from this class by name, throwing
+    an ArgumentError if it doesn't exist or isn't callable."""
+    if name[0] != '_' and name not in ['getOperation', 'addOperation']:
+      func = None
+      try:
+        func = getattr(self, name)
+      except AttributeError:
+        pass
+      if callable(func):
+        return func
+    raise ArgumentError(_("Unknown command \"{0}\"").format(name))
+
+  @classmethod
+  def addOperation(cls, name, func):
+    """Adds a subcommand.
+
+    Arguments:
+      name (str): name of the subcommand
+      func (Callable): code to run
+    """
+    from types import MethodType
+    cls.log.debug("Adding subcommand {name}".format(name=name))
+    setattr(cls, name, MethodType(func, cls))
+
+  @staticmethod
+  def getVdos(args, conf):
+    """Return a list of VdoService objects to be operated on depending
+    on the settings of the --name and --all options."""
+
+    volumes = []
+    if args.all:
+      for vdoName in conf.getAllVdos():
+        volumes.append(conf.getVdo(vdoName))
+    else:
+      if not args.name:
+        raise ArgumentError(_("Missing required argument '--name'"))
+      if not conf.haveVdo(args.name):
+        raise ArgumentError(_("VDO volume {0} not found").format(args.name))
+      volumes.append(conf.getVdo(args.name))
+    return volumes
+
+  @classmethod
+  def rootCheck(cls, c):
+    """Returns True iff this command is being run by 'root'."""
+    if os.getuid() == 0:
+      return True
+    else:
+      cls.log.error(_("You must be root to use the \"{0}\" command").format(
+          c))
+      return False
+
+  @classmethod
+  def _binaryCheck(cls):
+    """Returns True if required Albireo binaries can be found.
+    Issues an error message and returns False if one or more are missing."""
+    for executable in ['albcreate', 'albping', 'albserver', 'vdoformat']:
+      brandname = Brand.map(executable)
+      if not Utils.which(brandname):
+        e =  _("executable '{0}' not found in $PATH or --albireoBinaryPath")
+        cls.log.error(e.format(brandname))
+        return False
+    return True
+
+
+# "Line too long"
+#pylint: disable=C0301
+class VdoHelp(object):
+  """Help for the vdo command. Holds the strings used by the help
+  facility of OptionParser and it also provides per-command help.
+
+  Note 1: OptionParser runs all strings through _(), so we do not do
+  that for any of the strings in this class, but we do use _() on all
+  strings we print directly.
+
+  Note 2: it would be nice to use a dictionary for _commandTable, but
+  the order is significant (in the usage string and commands()
+  methods), and OrderedDict doesn't exist until Python 2.7.
+
+  Attributes:
+    _commandTable (list of dict): command information
+    _displayWidth (int): width of displayed information; uses the
+                         environment variable COLUMNS if set
+    mdRaid5ModeChoices (list of str): choices for MD RAID5 optimization mode
+    vdoLogLevelChoices (list of str): choices for log levels
+    writePolicyChoices (list of str): choices for write policies
+    options (dict): option descriptions, indexed by option name
+  """
+  def __init__(self):
+    self._commandTable = []
+    try:
+      self._displayWidth = int(os.environ['COLUMNS'])
+    except (KeyError, ValueError):
+      self._displayWidth = 80
+    self._displayWidth -= 2
+
+    self.mdRaid5ModeChoices = ['on', 'off']
+    self.vdoLogLevelChoices = ['critical', 'error', 'warning', 'notice',
+                               'info', 'debug']
+    self.writePolicyChoices = ['async', 'sync']
+    self.options = {'albireoBinaryPath': """Appends one or more
+directories to this command's search path. Used to locate directories
+containing Albireo binaries. Separate multiple paths with colons.""",
+                    'albireoIndexDir': """Specifies the directory in
+which to write the Albireo index, which must be given as an absolute
+pathname. If the directory does not already exist, it will be created.
+If the directory does exist, it must be empty. The default is
+{dir}-<volume>, where <volume> is the VDO volume
+specified using the --name option.""".format(dir=Defaults.albireoIndexDir),
+                    'albireoMem': """Specifies the amount of Albireo
+server memory in gigabytes; the default is the Albireo server's
+default. 0 requests the Albireo server's default. The special decimal
+values 0.25, 0.5, 0.75 can be used, as can any positive integer.""",
+                    'albireoSize': """Specifies the Albireo index size
+in megabytes. Using a value with a K(ilobytes), M(egabytes),
+G(igabytes), or T(erabytes) suffix is optional. If not specified, a
+default is calculated based on the memory allocated to the Albireo
+server via the --albireoMem option.""",
+                    'albireoSparse': "Enables sparse indexing.",
+                    'all': """Operates on all configured VDO volumes.
+May not be used with --name.""",
+                    'blockMapCacheSize': """Specifies the amount of
+memory allocated for cached block map pages in megabytes; it must be a
+multiple of --blockMapPageSize. Using a value with a K(ilobytes),
+M(egabytes), G(igabytes), or T(erabytes) suffix is optional. The
+default is %default.""",
+                    'blockMapPageSize': """Specifies the page size of
+the block map in bytes; it must be a multiple of {physBlock}.
+Using a value with a K(ilobytes) or M(egabytes) suffix is optional. The
+default is 32K, which is recommended for HDD; a 4K page size is
+recommended for SSD.""".format(physBlock=Defaults.vdoPhysicalBlockSize),
+                    'confFile': """Specifies an alternate
+configuration file; the default is %default.""",
+                    'enable512e': """Specifies that the VDO volume is to
+emulate a 512 byte block device.""",
+                    'force': """Unmounts mounted file systems before
+stopping a VDO volume.""",
+                    'forceRebuild': """Attempts to rebuild metadata for
+the VDO volume which is read-only.""",
+                    'lvIndex': """Specifies a logical volume name for
+the Albireo index. The name must not already be in use in the volume
+group (VG) specified by --volumeGroup. The default is <name>-index
+where <name> is the name of the VDO volume.""",
+                    'lvVdo': """Specifies a unique logical VDO volume
+name. The name must not already be in use in the volume group (VG)
+specified by --volumeGroup. The default is <name>-backing where <name>
+is the name of the VDO volume.""",
+                    'mdRaid5Mode': """Enables or disables performance
+optimizations for MD RAID5 storage configurations. The default is %default.
+Choices: {choices}.""".format(choices=','.join(self.mdRaid5ModeChoices)),
+                    'name': """Operates on the specified VDO volume.
+May not be used with --all.""",
+                    'noEnable': """Creates a VDO volume without
+enabling or starting it.""",
+                    'noRun': "Prints commands instead of executing them.",
+                    'port': """Specifies the Albireo server TCP port;
+must be a positive integer that is is not in use by other network
+services. The default is %default.""",
+                    'rebuildStatistics': """Rebuilds statistics when
+starting a VDO volume or volumes.""",
+                    'syslog': "Logs messages to the system logger.",
+                    'vdoLogLevel': """Specifies the VDO driver log
+level; levels are case-sensitive. The default is %default. Levels:
+{levels}.""".format(levels=','.join(self.vdoLogLevelChoices)),
+                    'vdoLogicalSize': """Specifies the logical VDO
+volume size in megabytes. Using a value with a K(ilobytes),
+M(egabytes), G(igabytes), or T(erabytes) suffix is optional. Used for
+over-provisioning volumes. This defaults to the same value as
+--vdoPhysicalSize.""",
+                    'vdoPhysicalSize': """Specifies the physical size
+of the VDO volume in megabytes. Using a value with a suffix of
+K(ilobytes), M(egabytes), G(igabytes) or T(erabytes) is optional. This
+defaults to the remaining free space in the volume group.""",
+                    'vdoReadCacheSize': """Specifies the extra VDO
+device read cache size in megabytes. This space is in addition to a
+system-defined minimum. Using a value with a suffix of K(ilobytes),
+M(egabytes), G(igabytes) or T(erabytes) is optional. The default is
+%default.""",
+                    'vdoRecoveryReserveSize': """Specifies the VDO device
+recovery reserve size in megabytes. Using a value with a suffix of K(ilobytes),
+M(egabytes), G(igabytes) or T(erabytes) is optional.
+The default is %default.""",
+                    'vdoRecoveryScanRate': """Specifies the scan rate while
+in recovery mode. A higher number indicates a faster rate. This argument is
+required if the recovery reserve size is set.""",
+                    'vdoRecoverySweepRate': """Specifies the sweep rate while
+in recovery mode. A higher number indicates a faster rate. This argument is
+required if the recovery reserve size is set.""",
+                    'verbose': "Prints commands before executing them.",
+                    'volumeGroup': "Specifies the volume group to use.",
+                    'writePolicy': """Specifies the write policy,
+either 'sync' or 'async'. 'sync' means writes are acknowledged only
+after data is on stable storage. 'async' means that writes are
+acknowledged when data has been cached for writing to stable storage.
+The default is '%default'."""}
+
+  def getOption(self, optionName):
+    """Returns the documentation string for a given option, or
+    optparse.SUPPRESS_HELP if there is none.
+
+    Arguments:
+      optionName (str): long option name without double dashes
+    """
+    try:
+      return self.options[optionName]
+    except KeyError:
+      return optparse.SUPPRESS_HELP
+
+  def addSubcommand(self, name, **kwargs):
+    """Add a subcommand to the end of the command table."""
+    cmd = {'name': name }
+    cmd.update(kwargs)
+    self._commandTable.append(cmd)
+
+  def insertSubcommand(self, after, name, **kwargs):
+    """Insert a subcommand into the command table after an existing
+    entry. If the entry does not exist, appends it.
+    """
+    cmd = {'name': name }
+    cmd.update(kwargs)
+    index = [c['name'] for c in self._commandTable].index(after)
+    if index == -1:
+      self.addSubcommand(name, **kwargs)
+    else:
+      self._commandTable.insert(index + 1, cmd)
+
+  def getUsage(self):
+    """Formats the usage message and returns it as a string."""
+    #
+    # To get TextWrapper to format the string, we trick it into
+    # thinking the subcommands are a large hyphenated word, then
+    # replace the hyphens with "|". "$" is used to temporarily escape
+    # the hyphens we do want to preserve.
+    #
+    commandList = [c['name'] for c in self._commandTable]
+    initial = "%prog $$name=<volume>|$$all [<option>...] "
+    subsequent = ' ' * 34
+    wrapper = TextWrapper(initial_indent=initial, subsequent_indent=subsequent,
+                          break_long_words=False, width=self._displayWidth)
+    usage = wrapper.fill('-'.join(commandList))
+    usage = usage.replace('-', '|')
+    usage = usage.replace('$', '-')
+    return usage
+
+  def commands(self, parser):
+    """Prints a list of commands and short descriptions of each to stdout."""
+    cmdWidth = max([len(c['name']) for c in self._commandTable])
+    for cmd in self._commandTable:
+      if cmd['shortdesc']:
+        print("  {name}  {desc}".format(name=cmd['name'].ljust(cmdWidth),
+                                        desc=_(cmd['shortdesc'])))
+    print("")
+    print(parser.expand_prog_name(_(
+          'For help on a particular command, type "%prog help <command>"')))
+
+  def subcommand(self, name, parser):
+    """Prints help for a given subcommand.
+
+    Constructs a second command parser whose sole purpose in life is
+    to print out a help message; this ensures that formatting stays
+    consistent.
+    """
+    if name == 'commands':
+      self.commands(parser)
+      return
+    cmds = [c for c in self._commandTable if c['name'] == name]
+    if len(cmds) == 0:
+      raise ArgumentError(_("Command {cmd} not known").format(cmd=name))
+    for cmd in cmds:
+      p = optparse.OptionParser(usage=cmd['usage'],
+                                description=cmd['description'],
+                                add_help_option=False)
+      if 'options' in cmd:
+        self._copyOptions(p, parser, cmd['options'])
+      if 'uniqueOptions' in cmd:
+        uniqDesc = "Must be unique per system"
+        uniqGroup = optparse.OptionGroup(p, uniqDesc)
+        self._copyOptions(uniqGroup, parser, cmd['uniqueOptions'])
+        p.add_option_group(uniqGroup)
+      if 'otherOptions' in cmd:
+        otherDesc = "Other options"
+        otherGroup = optparse.OptionGroup(p, otherDesc)
+        self._copyOptions(otherGroup, parser, cmd['otherOptions'])
+        p.add_option_group(otherGroup)
+      p.print_help()
+
+  @staticmethod
+  def _copyOptions(dest, src, opts):
+    """Copy a set of options from one OptionParser to another."""
+    for opt in opts:
+      dest.add_option(src.get_option(opt))
+
+
+class ExtOption(optparse.Option):
+  """Option class decorated with additional types.
+
+  Note that when parsing options we check the format of the string
+  only, and do not do additional checking for things like file
+  existence or permissions.
+  """
+  TYPES = optparse.Option.TYPES + ("abspath", "albmem", "lv", "pagesz",
+                                   "pow2", "size", "vg")
+  TYPE_CHECKER = copy.copy(optparse.Option.TYPE_CHECKER)
+  TYPE_CHECKER["abspath"] = Defaults.checkAbspath
+  TYPE_CHECKER["albmem"] = Defaults.checkAlbmem
+  TYPE_CHECKER["lv"] = Defaults.checkLv
+  TYPE_CHECKER["pagesz"] = Defaults.checkPagesz
+  TYPE_CHECKER["pow2"] = Defaults.checkPow2
+  TYPE_CHECKER["size"] = Defaults.checkSize
+  TYPE_CHECKER["vg"] = Defaults.checkVg
+
+
+def getVdoHelp():
+  """Sets up and returns the VdoHelp object for this command."""
+  vdoHelp = VdoHelp()
+  vdoHelp.addSubcommand("create",
+                        usage="%prog --name=<volume> [<option>...] create",
+                        shortdesc="Creates a new VDO volume and optionally starts it.",
+                        description="""Creates a VDO volume and its
+associated Albireo index and makes it available unless the --noEnable
+option is provided. This command must be run with root privileges.""",
+                        options=['--name', '--volumeGroup'],
+                        uniqueOptions=['--albireoIndexDir', '--lvIndex',
+                                       '--lvVdo', '--port'],
+                        otherOptions=['--albireoBinaryPath', '--albireoSize',
+                                      '--albireoMem', '--albireoSparse',
+                                      '--confFile',
+                                      '--enable512e',
+                                      '--mdRaid5Mode',
+                                      '--noEnable',
+                                      '--vdoLogLevel',
+                                      '--vdoLogicalSize',
+                                      '--vdoPhysicalSize',
+                                      '--vdoReadCacheSize',
+                                      '--vdoRecoveryReserveSize',
+                                      '--vdoRecoveryScanRate',
+                                      '--vdoRecoverySweepRate',
+                                      '--verbose', '--writePolicy',
+                                      '--noRun'])
+
+  vdoHelp.addSubcommand("remove",
+                        usage="%prog --name=<volume>|--all [<option>...] remove",
+                        shortdesc="Removes one or all existing VDO volumes.",
+                        description="""Removes one or more stopped VDO
+volumes and associated Albireo indexes. This command must be run with
+root privileges.""",
+                        options=['--name', '--all', '--albireoBinaryPath',
+                                 '--force', '--verbose', '--noRun'])
+
+  vdoHelp.addSubcommand("start",
+                        usage="%prog --name=<volume>|--all [<option>...] start",
+                        shortdesc="Starts one or all VDO volumes.",
+                        description="""Starts one or more stopped,
+enabled VDO volumes and associated Albireo services. This command must
+be run with root privileges.""",
+                        options=['--name', '--all', '--albireoBinaryPath',
+                                 '--forceRebuild', '--rebuildStatistics',
+                                 '--verbose', '--noRun'])
+
+  vdoHelp.addSubcommand("stop",
+                        usage="%prog --name=<volume>|--all [<option>...] stop",
+                        shortdesc="Stops one or all  VDO volumes.",
+                        description="""Stops one or more running VDO
+volumes and associated Albireo services. This command must be run with
+root privileges.""",
+                        options=['--name', '--all', '--albireoBinaryPath',
+                                 '--force', '--verbose', '--noRun'])
+
+  vdoHelp.addSubcommand("enable",
+                        usage="%prog --name=<volume>|--all [<option>...] enable",
+                        shortdesc="Enables one or all VDO volumes.",
+                        description="""Enables one or more VDO
+volumes. Enabled volumes can be started using the 'start' command.
+This command must be run with root privileges.""",
+                        options=['--name', '--all', '--albireoBinaryPath',
+                                 '--verbose', '--noRun'])
+
+  vdoHelp.addSubcommand("disable",
+                        usage="%prog --name=<volume>|--all [<option>...] disable",
+                        shortdesc="Disables one or all VDO volumes.",
+                        description="""Disables one or more VDO
+volumes. Disabled volumes cannot be started by the 'start' command.
+Disabling a currently running volume does not stop it, but once
+stopped it must be enabled before it can be started again. This
+command must be run with root privileges.""",
+                        options=['--name', '--all', '--albireoBinaryPath',
+                                 '--verbose', '--noRun'])
+
+  vdoHelp.addSubcommand("status",
+                        usage="%prog status",
+                        shortdesc="Displays VDO system status.",
+                        description="""Reports VDO system and volume
+status in YAML format. Status information will be incomplete if the
+command is not run with root privileges.""")
+
+  vdoHelp.addSubcommand("list",
+                        usage="%prog list",
+                        shortdesc="Displays a list of VDO devices.",
+                        description="Displays a list of available VDO volumes.")
+
+  vdoHelp.addSubcommand("modify",
+                        usage="%prog --name=<volume>|--all [<option>...] modify",
+                        shortdesc="Modifies configuration parameters of one or all VDO volumes.",
+                        description="""Modifies configuration parameters of
+one or all VDO volumes.
+
+Only some parameters can be changed. Changes take effect the next time the
+VDO device is started; already-running devices are not affected.""",
+                        options=['--name', '--all',
+                                 '--mdRaid5Mode', '--writePolicy',
+                                 '--verbose', '--noRun'])
+
+  vdoHelp.addSubcommand("enableDeduplication",
+                        usage="%prog --name=<volume>|--all [<option>...] enableDeduplication",
+                        shortdesc="Enables deduplication on one or all VDO volumes.",
+                        description="""Enables deduplication on one or
+more VDO volumes. If the VDO volume is running, deduplication will be
+started as well; otherwise, deduplication will be enabled the next
+time the VDO volume is started. This command must be run with root
+privileges.""",
+                        options=['--name', '--all', '--albireoBinaryPath',
+                                 '--verbose', '--noRun'])
+
+  vdoHelp.addSubcommand("disableDeduplication",
+                        usage="%prog --name=<volume>|--all [<option>...] disableDeduplication",
+                        shortdesc="Disables deduplication on one or all VDO volumes.",
+                        description="""Disables deduplication on one
+more VDO volumes. If the VDO volume is running, deduplication will be
+stopped as well; otherwise, deduplication will be disabled the next
+time the VDO volume is started. This command must be run with root
+privileges.""",
+                        options=['--name', '--all', '--albireoBinaryPath',
+                                 '--verbose', '--noRun'])
+
+  vdoHelp.addSubcommand("growLogical",
+                        usage="%prog --name=<volume> growLogical",
+                        shortdesc="Grows the logical size of a VDO volume.",
+                        description="""NOTE: This command is not yet
+implemented.
+
+Grows the logical size of a stopped VDO volume. This command must be
+run with root privileges.""",
+                        options=['--name', '--all', '--verbose', '--noRun'])
+
+  vdoHelp.addSubcommand("growPhysical",
+                        usage="%prog --name=<volume> [<option>...] growPhysical",
+                        shortdesc="Grows the physical size of a VDO volume.",
+                        description="""Grows the physical size of a
+VDO volume. The volume must exist and must be running. This command
+must be run with root privileges.""",
+                        options=['--name', '--all', '--vdoPhysicalSize',
+                                 '--verbose', '--noRun'])
+
+  vdoHelp.addSubcommand("printConfigFile",
+                        usage="%prog printConfigFile",
+                        shortdesc="Displays the configuration file.",
+                        description="Prints the configuration file to stdout.",
+                        options=['--confFile'])
+
+  return vdoHelp
+
+def getOptionParser(vdoHelp):
+  """Sets up and returns the OptionParser for this command."""
+  parser = optparse.OptionParser(option_class=ExtOption,
+                                 usage=vdoHelp.getUsage())
+  parser.add_option("--address", help=vdoHelp.getOption("address"),
+                    default=Defaults.address)
+  parser.add_option("--albireoBinaryPath",
+                    help=vdoHelp.getOption("albireoBinaryPath"),
+                    metavar='<path>')
+  parser.add_option("-a", "--all", help=vdoHelp.getOption("all"),
+                    action='store_true', dest='all')
+  parser.add_option("-f", "--confFile", help=vdoHelp.getOption("confFile"),
+                    metavar='<file>', default=Defaults.confFile)
+  parser.add_option("--customFile", help=vdoHelp.getOption("customFile"),
+                    default=Defaults.customFile)
+  parser.add_option("-d", "--debug", help=vdoHelp.getOption("debug"),
+                    action='store_true', dest='debug')
+  parser.add_option("--disableExtensions",
+                    help=vdoHelp.getOption("disableExtensions"), default="")
+  parser.add_option("--force", help=vdoHelp.getOption("force"),
+                    action='store_true', dest='force')
+  parser.add_option("--forceRebuild",
+                    help=vdoHelp.getOption("forceRebuild"),
+                    action='store_true', dest='forceRebuild')
+  parser.add_option("-n", "--name", help=vdoHelp.getOption("name"),
+                    metavar='<volume>')
+  parser.add_option("--noRun", help=vdoHelp.getOption("noRun"),
+                    action='store_true', dest='noRun')
+  parser.add_option("--rebuildStatistics",
+                    help=vdoHelp.getOption("rebuildStatistics"),
+                    action='store_true', dest='rebuildStatistics')
+  parser.add_option("--syslog", help=vdoHelp.getOption("syslog"),
+                    action='store_true', dest='syslog')
+  parser.add_option("--vdoLogicalSize",
+                    help=vdoHelp.getOption("vdoLogicalSize"),
+                    metavar='<megabytes>', type='size', default='0')
+  parser.add_option("--vdoPhysicalSize",
+                    help=vdoHelp.getOption("vdoPhysicalSize"),
+                    metavar='<megabytes>', type='size', default='0')
+  parser.add_option("--verbose", help=vdoHelp.getOption("verbose"),
+                    action='store_true', dest='verbose')
+
+  cGroup = optparse.OptionGroup(parser,
+                                "Options specific to the create command")
+  cGroup.add_option("--albireoIndexDir",
+                    help=vdoHelp.getOption("albireoIndexDir"),
+                    type='abspath', metavar='<absolute path>')
+  cGroup.add_option("--albireoMem", help=vdoHelp.getOption("albireoMem"),
+                    metavar='<gigabytes>',
+                    type='albmem', default=Defaults.albireoMem)
+  cGroup.add_option("--albireoSize", help=vdoHelp.getOption("albireoSize"),
+                    metavar='<megabytes>', type='size')
+  cGroup.add_option("--albireoSparse", help=vdoHelp.getOption("albireoSparse"),
+                    action='store_true', dest='albireoSparse', default=False)
+  cGroup.add_option("--blockMapCacheSize",
+                    help=vdoHelp.getOption("blockMapCacheSize"),
+                    metavar='<megabytes>', type='size',
+                    default=Defaults.blockMapCacheSize)
+  cGroup.add_option("--blockMapPageSize",
+                    help=vdoHelp.getOption("blockMapPageSize"),
+                    metavar='<kbytes>', type='pagesz',
+                    default=Defaults.blockMapPageSize)
+  cGroup.add_option("--enable512e",
+                    help=vdoHelp.getOption("enable512e"),
+                    action='store_true', dest='enable512e',
+                    default=Defaults.enable512e)
+  cGroup.add_option("--enableCompression",
+                    help=vdoHelp.getOption("enableCompression"),
+                    action='store_true', dest='enableCompression',
+                    default=Defaults.enableCompression)
+  cGroup.add_option("--enableDeduplication",
+                    help=vdoHelp.getOption("enableDeduplication"),
+                    action='store_true', dest='enableDeduplication',
+                    default=Defaults.enableDeduplication)
+  cGroup.add_option("--lvIndex", help=vdoHelp.getOption("lvIndex"), type='lv',
+                    metavar='<name>')
+  cGroup.add_option("--lvVdo", help=vdoHelp.getOption("lvVdo"), type='lv',
+                    metavar='<name>')
+  cGroup.add_option("--noEnable", help=vdoHelp.getOption("noEnable"),
+                    action='store_true', dest='noEnable')
+  cGroup.add_option("--port", help=vdoHelp.getOption("port"), type=int,
+                    metavar='<port>', default=Defaults.port)
+  cGroup.add_option("--vdoLogLevel", help=vdoHelp.getOption("vdoLogLevel"),
+                    metavar='<level>', choices=vdoHelp.vdoLogLevelChoices,
+                    default=Defaults.vdoLogLevel)
+  cGroup.add_option("--vdoReadCacheSize",
+                    help=vdoHelp.getOption("vdoReadCacheSize"),
+                    metavar='<megabytes>', type='size',
+                    default=Defaults.readCacheSize)
+  cGroup.add_option("--vdoRecoveryReserveSize",
+                    help=vdoHelp.getOption("vdoRecoveryReserveSize"),
+                    metavar='<megabytes>', type='size',
+                    default=Defaults.reserveSize)
+  cGroup.add_option("--vdoRecoveryScanRate",
+                    help=vdoHelp.getOption("vdoRecoveryScanRate"),
+                    metavar='<rate>', type=int)
+  cGroup.add_option("--vdoRecoverySweepRate",
+                    help=vdoHelp.getOption("vdoRecoverySweepRate"),
+                    metavar='<rate>', type=int)
+  cGroup.add_option("--volumeGroup", type='vg',
+                    help=vdoHelp.getOption("volumeGroup"),
+                    metavar='<group>', default=Defaults.volumeGroup)
+  parser.add_option_group(cGroup)
+
+  mGroup = optparse.OptionGroup(parser,
+                                "Options specific to the create and modify"
+                                + " commands")
+  mGroup.add_option("--mdRaid5Mode", help=vdoHelp.getOption("mdRaid5Mode"),
+                    type='choice', choices=vdoHelp.mdRaid5ModeChoices,
+                    metavar='<mode>', default=Defaults.mdRaid5Mode)
+  mGroup.add_option("--writePolicy", help=vdoHelp.getOption("writePolicy"),
+                    type='choice', choices=vdoHelp.writePolicyChoices,
+                    metavar='<policy>', default=Defaults.externalWritePolicy)
+  parser.add_option_group(mGroup)
+  return parser
+
+def main():
+  """The main program."""
+  try:
+    locale.setlocale(locale.LC_ALL, '')
+  except locale.Error:
+    pass
+  Extensions.init()
+  vdoHelp = getVdoHelp()
+
+  parser = getOptionParser(vdoHelp)
+  Extensions.prepare(parser, vdoHelp)
+  parser.usage = vdoHelp.getUsage()
+  (options, args) = parser.parse_args()
+  Logger.configure(sys.argv[0], os.path.abspath(__file__), options)
+  mainLogger = Logger.getLogger(Logger.myname)
+  Command.setDefaults(options)
+  Extensions.configure(options)
+
+  vdoOperations = VdoOperations()
+
+  if (len(args) in (1, 2)) and (args[0] == "help"):
+    if len(args) == 1:
+      parser.print_help()
+      sys.exit(0)
+    else:
+      try:
+        vdoHelp.subcommand(args[1], parser)
+        sys.exit(0)
+      except ArgumentError:
+        mainLogger.error(_("Unknown command \"{0}\"").format(args[1]))
+        sys.exit(2)
+
+  if os.path.exists(options.customFile):
+    Brand.init(options.customFile)
+
+  if len(args) != 1:
+    mainLogger.error(_("Must specify exactly one command"))
+    parser.print_usage()
+    sys.exit(2)
+
+  if options.name and options.all:
+    mainLogger.error(_("Only one of --name, --all can be specified"))
+    parser.print_usage()
+    sys.exit(2)
+
+  if options.albireoBinaryPath:
+    Utils.appendToPath(options.albireoBinaryPath)
+
+  exitval = 2
+  try:
+    with CommandLock('/var/lock/vdo', False):
+      func = vdoOperations.getOperation(args[0])
+      exitval = func(options)
+  except ArgumentError as msg:
+    mainLogger.error(msg)
+  except CommandLockTimeout as msg:
+    mainLogger.error(msg)
+  except BadConfigVersionError as msg:
+    mainLogger.error(msg)
+  except:
+    mainLogger.exception(str(sys.exc_info()[1]))
+  logging.shutdown()
+  sys.exit(exitval)
+
+if __name__ == "__main__":
+  main()

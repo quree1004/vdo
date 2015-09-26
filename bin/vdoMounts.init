@@ -1,0 +1,193 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          vdoMounts
+# Required-Start:    $network $local_fs $remote_fs
+# Required-Stop:     $network $local_fs $remote_fs
+# Should-Start:
+# Should-Stop:
+# Default-Start:     2 3 5
+# Default-Stop:      0 1 6
+# Short-Description: Permabit VDO logical volumes and file systems
+# Description:       Starts/stops logical volumes and/or file systems
+#                    mounted on Permabit VDO volumes.
+### END INIT INFO
+
+#
+# $Id$
+#
+# This script manages resources (logical volumes and file systems)
+# that use Permabit VDO devices for their underlying storage. It
+# performs the following actions:
+#
+# start
+#   - rescans devices (including VDO devices) looking for logical
+#     volumes
+#   - mounts any filesystems in /etc/fstab on a VDO device
+#   - mounts any filesystems in /etc/fstab on logical volumes on a VDO
+#     device
+#
+# stop
+#   - unmounts any filesystems on a VDO device
+#   - unmounts any filesystems on logical volumes on a VDO device
+#   - takes volume groups and logical volumes on VDO devices offline
+#
+# restart
+#   - simply calls this script with "stop" and then "start"
+#
+# status
+#   - prints a list of volume groups, logical volumes, and filesystems
+#     associated with VDO volumes
+#
+PATH=/bin:/usr/bin:/sbin:/usr/sbin
+DESC="Permabit VDO logical volumes and file systems"
+
+. /lib/lsb/init-functions
+
+# Use log_daemon_msg, etc., if they are available
+command -v log_daemon_msg 2>/dev/null | grep -q function || \
+    alias log_daemon_msg=/bin/echo
+command -v log_action_begin_msg 2>/dev/null | grep -q function || \
+    alias log_action_begin_msg=/bin/echo
+command -v log_action_end_msg 2>/dev/null | grep -q function || \
+    alias log_action_end_msg=/bin/true
+
+# Prints all volume groups using VDO device $1
+_getVgs() {
+  pv=$(readlink -f /dev/mapper/$1)
+  if [ -n "$pv" ]; then
+    vgs=$(pvs --noheadings $pv | awk '{print $2;}')
+    echo $vgs
+  fi
+}
+
+# Prints the logical volume path (volume-group/logical-volume) of all
+# LVs using VDO device $1
+_getLvs() {
+  vgs=$(_getVgs $1)
+  if [ -n "$vgs" ]; then
+    lvs=$(lvs --noheadings $vgs | awk '{print $2 "/" $1;}')
+    echo $lvs
+  fi
+}
+
+# Prints all file systems mounted on device $1
+_getMounts() {
+  canondev=$(readlink -f $1)
+  if [ -z "$canondev" ]; then
+    return
+  fi
+  for line in $(mount | awk '{ print $1 "@" $3; }'); do
+    dev=$(echo $line | cut -d@ -f1)
+    dev=$(readlink -f $dev)
+    if [ "$dev" = "$canondev" ]; then
+      echo $line | cut -d@ -f2
+    fi
+  done
+}
+
+# Prints all file systems in /etc/fstab mounted on device $1
+_getMountsEtcFstab() {
+  canondev=$(readlink -f $1)
+  if [ -z "$canondev" ]; then
+    return
+  fi
+  for line in $(awk '/^\/dev\// { print $1 "@" $2; }' /etc/fstab); do
+    dev=$(echo $line | cut -d@ -f1)
+    dev=$(readlink -f $dev)
+    if [ "$dev" = "$canondev" ]; then
+      echo $line | cut -d@ -f2
+    fi
+  done
+}
+
+case $1 in
+  start)
+    log_daemon_msg "Starting $DESC"
+
+    : Scan all devices for volume groups/logical volumes
+    vgscan --ignorelockingfailure --mknodes || :
+
+    VDO_DEVICES=$(dmsetup status|grep dedupe|cut -d: -f1)
+    for vdodevice in $VDO_DEVICES; do
+      fsvdo=$(_getMountsEtcFstab "/dev/mapper/$vdodevice")
+      if [ -n "$fsvdo" ]; then
+        log_action_begin_msg "Mounting filesystems on VDO volume $vdodevice"
+        mount $fsvdo
+        log_action_end_msg $?
+      fi
+
+      : Activate logical volumes that use the VDO volume
+      lvs=$(_getLvs $vdodevice)
+      lvchange -ay --ignorelockingfailure $lvs
+      for lv in $lvs; do
+        fslv=$(_getMountsEtcFstab "/dev/$lv")
+        if [ -n "$fslv" ]; then
+          log_action_begin_msg "Mounting filesystems on logical volume $lv"
+          mount $fslv
+          log_action_end_msg $?
+        fi
+      done
+    done
+    ;;
+
+  stop)
+    log_daemon_msg "Stopping $DESC"
+
+    VDO_DEVICES=$(dmsetup status|grep dedupe|cut -d: -f1)
+    for vdodevice in $VDO_DEVICES; do
+      fsvdo=$(_getMounts "/dev/mapper/$vdodevice")
+      if [ -n "$fsvdo" ]; then
+        log_action_begin_msg "Unmounting filesystems on VDO volume $vdodevice"
+        umount -f -r $fsvdo
+        log_action_end_msg $?
+      fi
+
+      : Deactivate logical volumes that use the VDO volume
+      lvs=$(_getLvs $vdodevice)
+      for lv in $lvs; do
+        fslv=$(_getMounts "/dev/$lv")
+        if [ -n "$fslv" ]; then
+          log_action_begin_msg "Unmounting filesystems on logical volume $lv"
+          umount -f -r $fslv
+          log_action_end_msg $?
+        fi
+        : Take the logical volume offline
+        lvchange -aln --ignorelockingfailure $lv
+      done
+
+      : Now take the volume group offline
+      vgs=$(_getVgs $vdodevice)
+      vgchange -aln --ignorelockingfailure $vgs || return 2
+    done
+    ;;
+
+  restart|force-reload)
+    $0 stop
+    sleep 1
+    $0 start
+    ;;
+
+  status)
+    VDO_DEVICES=$(dmsetup status|grep dedupe|cut -d: -f1)
+    for vdodevice in $VDO_DEVICES; do
+      : List LVM entities that use this VDO volume
+      vgs=$(_getVgs $vdodevice)
+      echo "Volume groups using $vdodevice: $vgs"
+      lvs=$(_getLvs $vdodevice)
+      echo "Logical volumes using $vdodevice: $lvs"
+
+      : List file systems mounted on this VDO volume or LVs
+      fsvdo=$(_getMounts "/dev/mapper/$vdodevice")
+      echo "File systems mounted on VDO volume $vdodevice: $fsvdo"
+      for lv in $lvs; do
+        fslv=$(_getMounts "/dev/$lv")
+        echo "File systems mounted on logical volume $lv: $fslv"
+      done
+    done
+    ;;
+
+  *)
+    echo 'Usage: vdoMounts {start|stop|status|restart}' >&2
+    exit 3
+    ;;
+esac

@@ -1,0 +1,44 @@
+<?xml version="2.0" encoding="UTF-8" ?>
+<!-- $Id: //eng/vdo-releases/nitrogen/src/c++/vdo/bin/vdoconfig.dtd#7 $ -->
+<!ENTITY vdoconfigVersion "1.0">
+<!ELEMENT vdoconfig (vdo*, albserver*)>
+<!ELEMENT vdo (blockMapCacheSize, blockMapPageSize,
+               enableCompression, enableDeduplication, enabled,
+               logicalBlockSize, logicalSize, logicalVolumePath,
+               mdRaid5Mode, physicalBlockSize, physicalSize, readCacheSize,
+               recoveryScanRate, recoverySweepRate, reserveSize,
+               server, writePolicy)>
+<!ELEMENT albserver (cfreq, enabled, indexPath, logicalVolumePath, memory,
+                     networkSpec, size, sparse, udsParallelFactor)>
+<!ELEMENT blockMapCacheSize (#PCDATA)>
+<!ELEMENT blockMapPageSize (#PCDATA)>
+<!ELEMENT cfreq (#PCDATA)>
+<!ELEMENT enableCompression (#PCDATA)>
+<!ELEMENT enableDeduplication (#PCDATA)>
+<!-- enabled must be 'True' or 'False'. -->
+<!ELEMENT enabled (#PCDATA)>
+<!ELEMENT indexPath (#PCDATA)>
+<!ELEMENT logicalBlockSize (#PCDATA)>
+<!ELEMENT logicalSize (#PCDATA)>
+<!ELEMENT logicalVolumePath (#PCDATA)>
+<!-- mdRaid5Mode must be either 'on' or 'off' -->
+<!ELEMENT mdRaid5Mode (#PCDATA)>
+<!ELEMENT memory (#PCDATA)>
+<!ELEMENT networkSpec (#PCDATA)>
+<!ELEMENT physicalBlockSize (#PCDATA)>
+<!ELEMENT physicalSize (#PCDATA)>
+<!ELEMENT readCacheSize (#PCDATA)>
+<!ELEMENT recoveryScanRate (#PCDATA)>
+<!ELEMENT recoverySweepRate (#PCDATA)>
+<!ELEMENT reserveSize (#PCDATA)>
+<!-- writePolicy must be 'async', 'sync', or 'read_from_superblock' -->
+<!ELEMENT writePolicy (#PCDATA)>
+<!ELEMENT server (#PCDATA)>
+<!ELEMENT size (#PCDATA)>
+<!-- sparse must be 'True' or 'False'. -->
+<!ELEMENT sparse (#PCDATA)>
+<!ELEMENT udsParallelFactor (#PCDATA)>
+
+<!ATTLIST vdoconfig version CDATA #REQUIRED>
+<!ATTLIST vdo name CDATA #REQUIRED>
+<!ATTLIST albserver uri CDATA #REQUIRED>
